@@ -7,10 +7,11 @@ running quietly in the system tray.
 
 It is built with Rust (all system work) and Tauri 2 + React (the settings window).
 
-> **Status:** 0.1.0, first release candidate. The core logic is covered by automated tests on
-> Linux and is type-checked for Windows. The Windows-specific parts (Win32 detection, icons,
-> named pipes, tray, installer) build in CI on a Windows runner and must be verified on a real
-> Windows 10/11 machine with the [manual QA checklist](docs/MANUAL_QA.md) before distribution.
+> **Status:** 0.1.0, first release candidate. The core logic is covered by automated tests;
+> the Windows-specific code (Win32 detection, icon extraction, named pipes) is compiled, linted
+> and unit tested for the Windows target, and has been executed under Wine. Tray behavior,
+> startup registration, the installer and real Discord clients still need to be verified on
+> real Windows 10/11 with the [manual QA checklist](docs/MANUAL_QA.md) before distribution.
 > See [Known limitations](#known-limitations).
 
 ---
@@ -239,7 +240,7 @@ npm run build
 
 What the automated tests cover:
 
-- **Core (Rust, ~150 tests):** identity normalization; rule matching and precedence; exclusion
+- **Core (Rust, 143 tests on Linux; 150 on the Windows target):** identity normalization; rule matching and precedence; exclusion
   precedence; priority ordering and tie-breaking; pin/unpin and pin clearing on exit; template
   rendering, unknown variables and escapes; Unicode-safe truncation (emoji ZWJ sequences,
   combining marks, astral characters); configuration validation, normalization, migration,
@@ -253,10 +254,13 @@ What the automated tests cover:
 - **Real transports:** a full session over a real Unix socket (Linux) and a real Windows named
   pipe (Windows CI), using unique pipe names so a running Discord is never contacted.
 - **Win32 (Windows only):** own-process identity, version metadata and icon extraction from
-  `explorer.exe`, window enumeration with title privacy.
-- **App shell:** tray model (labels, truncation, escaping, overflow, in-place updates), log
+  `explorer.exe`, window enumeration with title privacy. These run in Windows CI; during
+  development they were also executed under Wine 9.0 by cross-compiling the test binary
+  (`cargo test -p deskpresence-core --target x86_64-pc-windows-gnu --no-run`, then run the
+  `.exe` with `wine`) — all 150 tests pass there.
+- **App shell (11 tests):** tray model (labels, truncation, escaping, overflow, in-place updates), log
   rotation and tail, launch arguments, command input validation.
-- **Frontend (Vitest):** template and validation helpers, template input behavior, Settings
+- **Frontend (Vitest, 19 tests):** template and validation helpers, template input behavior, Settings
   validation/save/discard/reset confirmation, and the full onboarding flow with and without an
   Application ID.
 
