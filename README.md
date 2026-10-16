@@ -140,7 +140,9 @@ DeskPresence implements the documented *RPC over IPC* transport
 third-party crate: on Windows it connects to `\\?\pipe\discord-ipc-0` … `-9`, sends a
 `HANDSHAKE` (`{"v":1,"client_id":"…"}`), waits for the `READY` dispatch, then sends `SET_ACTIVITY`
 with its own process ID. Frames are an 8-byte little-endian header (opcode, length) plus JSON.
-`PING` is answered with `PONG`; `CLOSE` and errors trigger a reconnect.
+`PING` is answered with `PONG`; `CLOSE` and errors trigger a reconnect. If every pipe is busy
+(another program is connecting at the same moment), the status shows *Reconnecting* with
+“Discord's local connection is busy” rather than *Discord not running*, and DeskPresence retries.
 
 - **No secrets.** `SET_ACTIVITY` needs only the public Application ID — no OAuth flow, client
   secret or token exists in DeskPresence.
@@ -155,8 +157,15 @@ with its own process ID. Frames are an 8-byte little-endian header (opcode, leng
   DeskPresence shows that as “Accepted by the Discord client”. Discord provides no confirmation
   that the activity is visible to other people (privacy settings, “Display current activity”
   and Discord-side behavior are outside DeskPresence's control).
-- **Rejected artwork.** If Discord rejects an update that includes artwork, DeskPresence retries
-  once without artwork and shows a warning.
+- **Rejected updates.** If Discord rejects an update that includes artwork, DeskPresence retries
+  once without artwork (still within the rate limit) and shows a warning. If an update is
+  rejected outright, the previously shown activity is cleared so that stale text does not stay
+  on your profile; the status shows *Rejected by Discord* until a later update is accepted.
+- **Reconnects.** Retries back off with jitter from 1 s to 60 s (5 minutes for a rejected
+  Application ID). The backoff resets only after a healthy session (Discord answered, or the
+  connection stayed up with nothing to send), so a Discord client that accepts the connection
+  but never responds is not hammered. Manual
+  *Reconnect* requests are limited to one every 3 seconds.
 
 ## Setting up Discord
 
@@ -240,24 +249,26 @@ npm run build
 
 What the automated tests cover:
 
-- **Core (Rust, 143 tests on Linux; 150 on the Windows target):** identity normalization; rule matching and precedence; exclusion
+- **Core (Rust, 153 tests on Linux; 161 on the Windows target):** identity normalization; rule matching and precedence; exclusion
   precedence; priority ordering and tie-breaking; pin/unpin and pin clearing on exit; template
   rendering, unknown variables and escapes; Unicode-safe truncation (emoji ZWJ sequences,
   combining marks, astral characters); configuration validation, normalization, migration,
   atomic persistence, corrupt/partial/newer files, backups and import limits; activity payload
   construction; IPC frame encoding/decoding and malformed frames (unknown opcode, oversized,
   truncated, invalid JSON); connection state transitions, backoff timing, invalid IDs,
-  Discord restarts, timeouts, PING/PONG, rejected artwork, rate limiting, duplicate suppression,
-  clean shutdown; detector grouping, deduplication, exit handling, PID lookups failing mid-scan,
-  metadata caching and title privacy; icon-cache keys, corrupt cache files and negative caching;
+  Discord restarts, timeouts, PING/PONG, rejected artwork and rejected activities, rate limiting,
+  duplicate suppression, unresponsive clients, reconnect throttling, clean shutdown; detector
+  grouping, deduplication, exit handling, PID lookups failing mid-scan, metadata caching and
+  title privacy; icon-cache keys, corrupt cache files, negative caching and slow icon sources;
   end-to-end runtime tests (mock window system → engine → mock Discord server).
 - **Real transports:** a full session over a real Unix socket (Linux) and a real Windows named
-  pipe (Windows CI), using unique pipe names so a running Discord is never contacted.
+  pipe (Windows CI), plus a busy pipe, using unique pipe names so a running Discord is never
+  contacted.
 - **Win32 (Windows only):** own-process identity, version metadata and icon extraction from
   `explorer.exe`, window enumeration with title privacy. These run in Windows CI; during
   development they were also executed under Wine 9.0 by cross-compiling the test binary
   (`cargo test -p deskpresence-core --target x86_64-pc-windows-gnu --no-run`, then run the
-  `.exe` with `wine`) — all 150 tests pass there.
+  `.exe` with `wine`) — all 161 tests pass there.
 - **App shell (11 tests):** tray model (labels, truncation, escaping, overflow, in-place updates), log
   rotation and tail, launch arguments, command input validation.
 - **Frontend (Vitest, 19 tests):** template and validation helpers, template input behavior, Settings
@@ -266,6 +277,20 @@ What the automated tests cover:
 
 The Discord tests run against an in-process mock IPC server (`discord_rpc/mock.rs`) with Tokio's
 paused clock, so reconnect and backoff behavior is deterministic and needs no Discord client.
+
+### Measured resource use (indicative only)
+
+No Windows measurements exist yet; record them with section 7 of
+[docs/MANUAL_QA.md](docs/MANUAL_QA.md). The only measurement so far is the **Linux** release build
+(WebKitGTK, under Xvfb) with the mock detector, over 120 seconds with the webview loaded:
+
+| Situation | Main process CPU | Main process memory |
+|-----------|------------------|---------------------|
+| Discord not running (backing off) | 0.08 % of one core | ≈ 126 MB RSS, 21 threads |
+| Connected to a mock Discord, focus changing every 8 s (15 updates sent) | 0.08 % of one core | ≈ 126 MB RSS, open handles stable |
+
+The WebKitGTK helper processes used another ≈ 160 MB and ≈ 47 MB. Windows uses WebView2
+instead, so its numbers will differ.
 
 ## Building the Windows installer
 
@@ -331,10 +356,11 @@ Use **Pause** (tray or window) to stop sharing temporarily and **Exit** to quit 
 | Symptom | What to try |
 |---------|-------------|
 | “Discord not running” | Start the Discord **desktop** app (the browser version has no local connection). DeskPresence retries automatically (1 s → 60 s). **Diagnostics → Reconnect** retries now. |
+| *Reconnecting* — “Discord's local connection is busy” | Another program is connecting to Discord at the same moment. DeskPresence retries on its own; if it persists, close other Rich Presence tools. |
 | “ID rejected” | The Application ID doesn't belong to an existing Discord application. Copy it again from the Developer Portal. |
 | Connected, but friends don't see the activity | In Discord's *Activity Privacy* settings, allow sharing your activity. Discord may also hide activity in some contexts; DeskPresence can only confirm the local client accepted it. |
 | Artwork missing | The asset key must match an uploaded asset of *your* Discord application (newly uploaded assets can take a few minutes to appear), or be an `https://` URL. |
-| An app is missing from the list | Only apps with normal, visible windows are detected. Minimized Store (UWP) apps can disappear while suspended. Tool/overlay windows and Windows shell surfaces are ignored by design. Apps running as administrator are detected, but their window titles may be unavailable. |
+| An app is missing from the list | Only apps with normal, visible windows are detected. Minimized Store (UWP) apps stay listed if DeskPresence saw them before they were minimized; one that was already minimized when DeskPresence started appears once it is restored. Tool/overlay windows and Windows shell surfaces are ignored by design. Apps running as administrator are detected, but their window titles may be unavailable. |
 | Wrong app shown | Check **Rules** (mode, exclusions, priorities) and **Diagnostics → Presence source**. Increase *Focus change delay* if quick popups steal the presence. |
 | The tray icon is hidden | Drag it from the taskbar's “^” overflow area. |
 | Settings were reset | See the notice on Overview: the previous file was saved next to `config.json`. |
