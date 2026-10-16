@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rescan-now"
+description = "Enables the rescan_now command without any pre-configured scope."
+commands.allow = ["rescan_now"]
+
+[[permission]]
+identifier = "deny-rescan-now"
+description = "Denies the rescan_now command without any pre-configured scope."
+commands.deny = ["rescan_now"]

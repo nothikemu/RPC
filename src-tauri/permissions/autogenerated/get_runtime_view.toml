@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-runtime-view"
+description = "Enables the get_runtime_view command without any pre-configured scope."
+commands.allow = ["get_runtime_view"]
+
+[[permission]]
+identifier = "deny-get-runtime-view"
+description = "Denies the get_runtime_view command without any pre-configured scope."
+commands.deny = ["get_runtime_view"]

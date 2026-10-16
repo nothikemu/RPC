@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeskPresence",
+  "version": "0.1.0",
+  "identifier": "com.deskpresence.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "DeskPresence",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 860,
+        "minHeight": 560,
+        "visible": false,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "DeskPresence contributors",
+    "copyright": "Copyright © DeskPresence contributors. MIT License.",
+    "category": "Utility",
+    "shortDescription": "Discord Rich Presence for the apps you use",
+    "longDescription": "DeskPresence runs in the Windows system tray, detects the applications you use and shows them as a customizable Discord Rich Presence.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
+    }
+  }
+}

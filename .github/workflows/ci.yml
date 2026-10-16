@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows — checks, tests and installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend type check
+        run: npm run typecheck
+
+      - name: Frontend lint
+        run: npm run lint
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Frontend production build
+        run: npm run build
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Rust tests (includes Win32 API and named-pipe tests)
+        run: cargo test --workspace --all-features
+
+      - name: TypeScript bindings are up to date
+        shell: bash
+        run: git diff --exit-code -- src/lib/bindings
+
+      - name: Build Windows installer
+        run: npm run tauri build
+        env:
+          # Optional public Discord Application ID compiled in as the default.
+          DESKPRESENCE_DEFAULT_APP_ID: ${{ vars.DESKPRESENCE_DEFAULT_APP_ID }}
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskpresence-windows-installer
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux — core logic and frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm test
+      - name: Core tests (platform-independent logic, Unix socket transport)
+        run: cargo test -p deskpresence-core --all-features
+      - name: Core clippy
+        run: cargo clippy -p deskpresence-core --all-targets --all-features -- -D warnings

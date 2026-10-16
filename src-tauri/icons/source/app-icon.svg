@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- DeskPresence mark: an application window with a presence dot. -->
+  <rect x="48" y="48" width="928" height="928" rx="220" fill="#4F55E3"/>
+  <rect x="212" y="262" width="600" height="468" rx="76" fill="none" stroke="#FFFFFF" stroke-width="60"/>
+  <rect x="212" y="262" width="600" height="132" rx="66" fill="#FFFFFF"/>
+  <rect x="212" y="330" width="600" height="64" fill="#FFFFFF"/>
+  <circle cx="770" cy="722" r="150" fill="#4F55E3"/>
+  <circle cx="770" cy="722" r="104" fill="#3DD68C"/>
+</svg>

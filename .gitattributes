@@ -1,0 +1,4 @@
+# Consistent line endings on every platform (generated bindings are diffed in CI).
+* text=auto eol=lf
+*.png binary
+*.ico binary
