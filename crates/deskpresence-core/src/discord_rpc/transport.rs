@@ -1,8 +1,8 @@
 //! Local IPC endpoint discovery.
 //!
 //! Windows: named pipes `\\?\pipe\discord-ipc-0` … `discord-ipc-9` (the
-//! documented path). The first pipe that accepts a connection is used; busy
-//! or missing pipes are skipped. Unix (development only): sockets named
+//! documented path). The first pipe that accepts a connection is used;
+//! missing pipes are skipped and busy pipes are retried briefly. Unix (development only): sockets named
 //! `discord-ipc-N` under `XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`, `/tmp`.
 
 use std::future::Future;
@@ -66,24 +66,48 @@ impl Connector for PlatformConnector {
 
         const ERROR_FILE_NOT_FOUND: i32 = 2;
         const ERROR_PIPE_BUSY: i32 = 231;
+        /// A busy pipe exists but has no free instance right now; retry briefly
+        /// (the documented client pattern) before moving on.
+        const BUSY_RETRIES: u32 = 20;
+        const BUSY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
         let mut other_error: Option<std::io::Error> = None;
+        let mut busy = false;
         for slot in 0..IPC_SLOTS {
             let name = format!("{}{slot}", self.prefix);
             let path = format!(r"\\?\pipe\{name}");
-            match ClientOptions::new().open(&path) {
-                Ok(stream) => {
-                    return Ok(Connected {
-                        stream,
-                        endpoint: name,
-                    });
+            let mut attempts = 0;
+            loop {
+                match ClientOptions::new().open(&path) {
+                    Ok(stream) => {
+                        return Ok(Connected {
+                            stream,
+                            endpoint: name,
+                        });
+                    }
+                    Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                        attempts += 1;
+                        if attempts > BUSY_RETRIES {
+                            busy = true;
+                            break;
+                        }
+                        tokio::time::sleep(BUSY_DELAY).await;
+                    }
+                    Err(e)
+                        if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND)
+                            || e.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        break;
+                    }
+                    Err(e) => {
+                        other_error = Some(e);
+                        break;
+                    }
                 }
-                Err(e)
-                    if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND)
-                        || e.kind() == std::io::ErrorKind::NotFound
-                        || e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {}
-                Err(e) => other_error = Some(e),
             }
+        }
+        if busy {
+            return Err(RpcError::Busy);
         }
         Err(other_error.map_or(RpcError::NotRunning, RpcError::Io))
     }
@@ -272,5 +296,31 @@ mod tests {
         });
         let connector = PlatformConnector::with_prefix(prefix, None);
         run_service_against(connector, &mock).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_busy_pipe_is_reported_as_busy_not_as_missing() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let prefix = unique_prefix();
+        let pipe = format!(r"\\.\pipe\{prefix}0");
+        // One instance only, already taken by another client.
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .create(&pipe)
+            .unwrap();
+        let _other_client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&pipe)
+            .unwrap();
+        let connector = PlatformConnector::with_prefix(prefix, None);
+        let started = std::time::Instant::now();
+        assert!(matches!(connector.connect().await, Err(RpcError::Busy)));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(500),
+            "retried before giving up"
+        );
+        drop(server);
     }
 }

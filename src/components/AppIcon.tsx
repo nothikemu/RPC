@@ -29,8 +29,11 @@ function request(backend: Backend, key: string, resolve: (url: string | null) =>
       // Fall back to the generic icon; nothing to report to the user.
     }
     for (const k of keys) {
-      const url = result[k] ?? null;
-      cache.set(k, url);
+      // Missing keys were not resolved in time: show the fallback now and ask
+      // again next time instead of remembering "no icon".
+      const answered = Object.prototype.hasOwnProperty.call(result, k);
+      const url = answered ? (result[k] ?? null) : null;
+      if (answered) cache.set(k, url);
       callbacks.get(k)?.forEach((cb) => cb(url));
     }
   });

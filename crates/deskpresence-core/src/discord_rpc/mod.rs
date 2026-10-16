@@ -28,11 +28,15 @@ pub use transport::{Connector, PlatformConnector};
 pub const CLOSE_INVALID_CLIENT_ID: i64 = 4000;
 /// Discord's close code for rate limiting.
 pub const CLOSE_RATE_LIMITED: i64 = 4002;
+/// Discord's RPC *error* code (ERROR events) for an invalid client ID.
+pub const ERROR_INVALID_CLIENT_ID: i64 = 4007;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("Discord is not running, or its local RPC endpoint is unavailable")]
     NotRunning,
+    #[error("Discord's local connection is busy (another program may be connecting)")]
+    Busy,
     #[error("I/O error talking to Discord: {0}")]
     Io(#[from] std::io::Error),
     #[error("Discord closed the connection: the application ID was rejected ({message})")]
@@ -57,7 +61,7 @@ impl RpcError {
             RpcError::NotRunning => DiscordErrorKind::NotRunning,
             RpcError::InvalidClientId { .. } => DiscordErrorKind::InvalidApplicationId,
             RpcError::Timeout => DiscordErrorKind::Timeout,
-            RpcError::Io(_) => DiscordErrorKind::Io,
+            RpcError::Io(_) | RpcError::Busy => DiscordErrorKind::Io,
             RpcError::Closed { .. } | RpcError::Eof => DiscordErrorKind::Closed,
             RpcError::Protocol(_) | RpcError::FrameTooLarge(_) | RpcError::UnknownOpcode(_) => {
                 DiscordErrorKind::Protocol

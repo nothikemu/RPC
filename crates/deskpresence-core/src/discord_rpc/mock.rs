@@ -30,6 +30,8 @@ pub enum Behavior {
     RejectAll,
     /// Completes the handshake, then never answers commands.
     Silent,
+    /// Answers the handshake with an ERROR event carrying this RPC error code.
+    HandshakeError(i64),
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +191,15 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         return;
     }
     let behavior = *lock(&inner.behavior);
+    if let Behavior::HandshakeError(code) = behavior {
+        let _ = send(
+            &mut stream,
+            Opcode::Frame,
+            &json!({"cmd": "DISPATCH", "evt": "ERROR", "data": {"code": code, "message": "handshake refused"}}),
+        )
+        .await;
+        return;
+    }
     if behavior == Behavior::InvalidClientId {
         let _ = send(
             &mut stream,

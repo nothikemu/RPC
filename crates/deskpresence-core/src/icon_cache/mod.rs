@@ -167,8 +167,16 @@ pub struct IconCache {
     extractor: Box<dyn IconExtractor>,
     /// `None` records a failed extraction (negative cache).
     memory: HashMap<String, Option<Arc<str>>>,
+    /// Paths whose file-system access was very slow (e.g. a disconnected
+    /// network share), skipped until the recorded time.
+    unreachable: HashMap<String, std::time::Instant>,
     extractions: u32,
 }
+
+/// File-system or shell access slower than this marks a path as unreachable.
+const SLOW_ACCESS: Duration = Duration::from_secs(2);
+/// How long an unreachable path is skipped.
+const UNREACHABLE_FOR: Duration = Duration::from_secs(600);
 
 impl IconCache {
     pub fn new(dir: impl Into<PathBuf>, extractor: Box<dyn IconExtractor>) -> Self {
@@ -176,6 +184,7 @@ impl IconCache {
             dir: dir.into(),
             extractor,
             memory: HashMap::new(),
+            unreachable: HashMap::new(),
             extractions: 0,
         }
     }
@@ -185,9 +194,28 @@ impl IconCache {
         self.extractions
     }
 
+    fn mark_if_slow(&mut self, exe_path: &str, started: std::time::Instant) {
+        if started.elapsed() >= SLOW_ACCESS {
+            tracing::debug!("icon source is slow to access; skipping it for a while");
+            self.unreachable.insert(
+                exe_path.to_lowercase(),
+                std::time::Instant::now() + UNREACHABLE_FOR,
+            );
+        }
+    }
+
     /// Returns the icon as a PNG data URL, or `None` to use the fallback icon.
     pub fn get(&mut self, app_key: &AppKey, exe_path: &str) -> Option<Arc<str>> {
+        let path_key = exe_path.to_lowercase();
+        if let Some(until) = self.unreachable.get(&path_key) {
+            if std::time::Instant::now() < *until {
+                return None;
+            }
+            self.unreachable.remove(&path_key);
+        }
+        let started = std::time::Instant::now();
         let stamp = FileStamp::of(exe_path);
+        self.mark_if_slow(exe_path, started);
         let key = cache_key(app_key, stamp, ICON_SIZE);
         if let Some(entry) = self.memory.get(&key) {
             return entry.clone();
@@ -214,11 +242,13 @@ impl IconCache {
         }
 
         self.extractions += 1;
+        let started = std::time::Instant::now();
         let result = self
             .extractor
             .extract(exe_path, ICON_SIZE)
             .and_then(|image| encode_png(&image))
             .and_then(|png| validate_png(&png).map(|_| png));
+        self.mark_if_slow(exe_path, started);
         match result {
             Ok(png) => {
                 if let Err(error) = write_atomic(&file, &png) {
@@ -276,6 +306,8 @@ type IconReply = oneshot::Sender<Vec<(AppKey, Option<Arc<str>>)>>;
 
 struct IconRequest {
     items: Vec<(AppKey, String)>,
+    /// Items not started before this point are left unanswered.
+    deadline: std::time::Instant,
     reply: IconReply,
 }
 
@@ -298,14 +330,14 @@ impl IconService {
                 let mut cache = IconCache::new(dir, make_extractor());
                 cache.prune();
                 while let Ok(request) = rx.recv() {
-                    let results = request
-                        .items
-                        .into_iter()
-                        .map(|(key, path)| {
-                            let url = cache.get(&key, &path);
-                            (key, url)
-                        })
-                        .collect();
+                    let mut results = Vec::with_capacity(request.items.len());
+                    for (key, path) in request.items {
+                        if std::time::Instant::now() >= request.deadline {
+                            break;
+                        }
+                        let url = cache.get(&key, &path);
+                        results.push((key, url));
+                    }
                     let _ = request.reply.send(results);
                 }
             })?;
@@ -313,20 +345,31 @@ impl IconService {
     }
 
     /// Resolves icons for `(key, exe path)` pairs, waiting at most `limit`.
+    ///
+    /// Only answered keys are returned: `None` means "this executable has no
+    /// usable icon", while a missing key means "not resolved yet" (queue full,
+    /// time limit reached), so the caller can ask again later.
     pub async fn get(
         &self,
         items: Vec<(AppKey, String)>,
         limit: Duration,
     ) -> Vec<(AppKey, Option<Arc<str>>)> {
         let (reply, rx) = oneshot::channel();
-        let keys: Vec<AppKey> = items.iter().map(|(k, _)| k.clone()).collect();
-        if self.requests.try_send(IconRequest { items, reply }).is_err() {
-            // Queue full or service gone: the UI keeps its fallback icons.
-            return keys.into_iter().map(|k| (k, None)).collect();
+        let deadline = std::time::Instant::now() + limit.saturating_sub(Duration::from_millis(250));
+        if self
+            .requests
+            .try_send(IconRequest {
+                items,
+                deadline,
+                reply,
+            })
+            .is_err()
+        {
+            return Vec::new();
         }
         match tokio::time::timeout(limit, rx).await {
             Ok(Ok(results)) => results,
-            _ => keys.into_iter().map(|k| (k, None)).collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -522,6 +565,46 @@ mod tests {
         prune_dir(dir.path(), 5);
         let remaining = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(remaining, 5);
+    }
+
+    struct SlowExtractor;
+
+    impl IconExtractor for SlowExtractor {
+        fn extract(&mut self, _: &str, _: u32) -> Result<RgbaImage, IconError> {
+            std::thread::sleep(SLOW_ACCESS + Duration::from_millis(50));
+            Err(IconError::NoIcon)
+        }
+    }
+
+    #[test]
+    fn slow_sources_are_skipped_for_a_while() {
+        let exes = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let exe = fake_exe(&exes, "slow.exe");
+        let mut cache = IconCache::new(cache_dir.path(), Box::new(SlowExtractor));
+        assert_eq!(cache.get(&key(&exe), &exe), None);
+        // Second call returns immediately without touching the slow source.
+        let started = std::time::Instant::now();
+        assert_eq!(cache.get(&key(&exe), &exe), None);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(cache.extractions(), 1);
+    }
+
+    #[tokio::test]
+    async fn unanswered_keys_are_omitted_not_reported_as_missing_icons() {
+        let exes = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let slow = fake_exe(&exes, "slow.exe");
+        let fast = fake_exe(&exes, "fast.exe");
+        let service = IconService::spawn(cache_dir.path().to_path_buf(), || Box::new(SlowExtractor)).unwrap();
+        let results = service
+            .get(
+                vec![(key(&slow), slow.clone()), (key(&fast), fast.clone())],
+                Duration::from_millis(600),
+            )
+            .await;
+        // The slow item exceeded the limit: nothing is claimed about either key.
+        assert!(results.iter().all(|(k, _)| *k != key(&fast)), "{results:?}");
     }
 
     #[tokio::test]

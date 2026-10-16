@@ -393,3 +393,214 @@ async fn changing_the_application_id_reconnects() {
     .await;
     handle.shutdown(Duration::from_secs(1)).await;
 }
+
+// ── Regression tests for review findings ─────────────────────────────────
+
+fn with_art(details: &str) -> Activity {
+    let mut a = activity(details);
+    a.assets = Some(ActivityAssets {
+        large_image: Some("art".into()),
+        ..ActivityAssets::default()
+    });
+    a
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_activity_clears_the_previous_one() {
+    let mock = MockDiscord::new(Behavior::Normal);
+    let (handle, desired, mut status) = start(&mock, Some(APP_ID));
+    desired.send_replace(Some(activity("Editing secret.docx")));
+    wait_for(&mut status, "accepted", |s| {
+        s.delivery == ActivityDelivery::Accepted
+    })
+    .await;
+
+    mock.set_behavior(Behavior::RejectAll);
+    desired.send_replace(Some(activity("Other app")));
+    wait_for(&mut status, "rejected", |s| {
+        s.delivery == ActivityDelivery::Rejected
+    })
+    .await;
+    // The old activity must not stay on the profile.
+    wait_for(&mut status, "stale cleared", |_| {
+        mock.activities().last() == Some(&serde_json::Value::Null)
+    })
+    .await;
+    // ...but the rejection itself is not retried in a loop.
+    settle(Duration::from_secs(60)).await;
+    assert_eq!(mock.activities().len(), 3);
+    assert_eq!(status.borrow().delivery, ActivityDelivery::Rejected);
+    handle.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn returning_to_the_shown_activity_restores_the_status() {
+    let mock = MockDiscord::new(Behavior::Normal);
+    let (handle, desired, mut status) = start(&mock, Some(APP_ID));
+    desired.send_replace(Some(activity("X")));
+    wait_for(&mut status, "accepted", |s| {
+        s.delivery == ActivityDelivery::Accepted
+    })
+    .await;
+
+    // Everything is rejected now, including the attempt to clear X.
+    mock.set_behavior(Behavior::RejectAll);
+    desired.send_replace(Some(activity("Y")));
+    wait_for(&mut status, "rejected", |s| {
+        s.delivery == ActivityDelivery::Rejected
+    })
+    .await;
+    wait_for(&mut status, "clear attempted", |_| mock.activities().len() == 3).await;
+    settle(Duration::from_millis(100)).await;
+
+    // Discord still shows X; going back to X must not keep reporting a rejection.
+    desired.send_replace(Some(activity("X")));
+    let s = wait_for(&mut status, "accepted again", |s| {
+        s.delivery == ActivityDelivery::Accepted
+    })
+    .await;
+    assert_eq!(s.last_delivery_error, None);
+    settle(Duration::from_secs(30)).await;
+    assert_eq!(
+        mock.activities().len(),
+        3,
+        "X is already shown; nothing is re-sent"
+    );
+    handle.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unresponsive_discord_does_not_reset_the_backoff() {
+    let mock = MockDiscord::new(Behavior::Silent);
+    let (handle, desired, mut status) = start(&mock, Some(APP_ID));
+    desired.send_replace(Some(activity("A")));
+    wait_for(&mut status, "first timeout", |s| {
+        s.last_error_kind == Some(DiscordErrorKind::Timeout)
+    })
+    .await;
+    settle(Duration::from_secs(600)).await;
+    // With a reset every cycle this would be ~56 connections; with growing
+    // backoff (up to 60 s) plus the 10 s response timeout it is far fewer.
+    let connects = mock.connects();
+    assert!(
+        (4..=15).contains(&connects),
+        "reconnected {connects} times in 10 minutes"
+    );
+    handle.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_artwork_retry_respects_the_rate_limit_and_later_changes() {
+    let mock = MockDiscord::new(Behavior::Normal);
+    let (handle, desired, mut status) = start(&mock, Some(APP_ID));
+    wait_for(&mut status, "connected", |s| {
+        s.phase == ConnectionPhase::Connected
+    })
+    .await;
+    for i in 0..4 {
+        desired.send_replace(Some(activity(&format!("update {i}"))));
+        wait_for(&mut status, "accepted", |_| mock.activities().len() == i + 1).await;
+        settle(Duration::from_millis(10)).await;
+    }
+    mock.set_behavior(Behavior::RejectAssets);
+    desired.send_replace(Some(with_art("Secret")));
+    wait_for(&mut status, "artwork rejected", |s| {
+        s.last_delivery_error.is_some()
+    })
+    .await;
+    // The window is full (5 sends): the retry must wait, not go out immediately.
+    settle(Duration::from_secs(5)).await;
+    assert_eq!(mock.activities().len(), 5);
+
+    // The user pauses before the retry could be sent: the retry is dropped.
+    desired.send_replace(None);
+    settle(Duration::from_secs(30)).await;
+    let activities = mock.activities();
+    assert_eq!(activities.len(), 6, "{activities:?}");
+    assert_eq!(activities.last(), Some(&serde_json::Value::Null));
+    handle.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn handshake_error_events_use_the_rpc_error_table() {
+    // ERROR 4000 means "Invalid payload" in the RPC error table: not an invalid ID.
+    let mock = MockDiscord::new(Behavior::HandshakeError(4000));
+    let (handle, _desired, mut status) = start(&mock, Some(APP_ID));
+    let s = wait_for(&mut status, "failure", |s| {
+        s.phase == ConnectionPhase::WaitingToRetry
+    })
+    .await;
+    assert_eq!(s.last_error_kind, Some(DiscordErrorKind::Protocol));
+    handle.shutdown(Duration::from_secs(1)).await;
+
+    // ERROR 4007 is "Invalid client ID".
+    let mock = MockDiscord::new(Behavior::HandshakeError(4007));
+    let (handle, _desired, mut status) = start(&mock, Some(APP_ID));
+    wait_for(&mut status, "invalid id", |s| {
+        s.phase == ConnectionPhase::InvalidApplicationId
+    })
+    .await;
+    handle.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_does_not_keep_stale_connection_details() {
+    let mock = MockDiscord::new(Behavior::Normal);
+    let (handle, _desired, mut status) = start(&mock, Some(APP_ID));
+    wait_for(&mut status, "connected", |s| {
+        s.phase == ConnectionPhase::Connected
+    })
+    .await;
+    handle.configure(config(None)).await;
+    let s = wait_for(&mut status, "not configured", |s| {
+        s.phase == ConnectionPhase::NotConfigured
+    })
+    .await;
+    assert_eq!(
+        (s.endpoint, s.user_name, s.connected_since_ms),
+        (None, None, None)
+    );
+    handle.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_shutdown_clear_is_not_reported_as_cleared() {
+    let mock = MockDiscord::new(Behavior::Normal);
+    let (handle, desired, mut status) = start(&mock, Some(APP_ID));
+    desired.send_replace(Some(activity("A")));
+    wait_for(&mut status, "accepted", |s| {
+        s.delivery == ActivityDelivery::Accepted
+    })
+    .await;
+    mock.set_behavior(Behavior::RejectAll);
+    handle.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(
+        mock.activities().last(),
+        Some(&serde_json::Value::Null),
+        "a clear was attempted"
+    );
+    assert_eq!(status.borrow().delivery, ActivityDelivery::Accepted);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_requests_are_throttled() {
+    let mock = MockDiscord::new(Behavior::Normal);
+    let (handle, _desired, mut status) = start(&mock, Some(APP_ID));
+    wait_for(&mut status, "connected", |s| {
+        s.phase == ConnectionPhase::Connected
+    })
+    .await;
+    for _ in 0..100 {
+        handle.reconnect().await;
+        settle(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        mock.connects(),
+        1,
+        "requests within the minimum interval are ignored"
+    );
+    settle(Duration::from_secs(4)).await;
+    handle.reconnect().await;
+    wait_for(&mut status, "reconnected", |_| mock.connects() == 2).await;
+    handle.shutdown(Duration::from_secs(1)).await;
+}

@@ -20,7 +20,7 @@ use serde::Serialize;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout};
 
 use super::activity::Activity;
 use super::backoff::{Backoff, RateLimiter};
@@ -29,7 +29,7 @@ use super::protocol::{
     set_activity_payload, write_frame,
 };
 use super::transport::{Connected, Connector, discord_install_detected};
-use super::{CLOSE_INVALID_CLIENT_ID, RpcError};
+use super::{CLOSE_INVALID_CLIENT_ID, ERROR_INVALID_CLIENT_ID, RpcError};
 use crate::time::now_unix_ms;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,7 +39,8 @@ pub const CLEAR_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 pub const INVALID_ID_RETRY: Duration = Duration::from_secs(300);
-/// A connection that lasted at least this long resets the backoff.
+/// A connection with nothing to send that lasted at least this long counts as
+/// healthy (resets the backoff). Otherwise Discord must have answered a command.
 pub const STABLE_CONNECTION: Duration = Duration::from_secs(10);
 pub const RATE_LIMIT_MAX: usize = 5;
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(20);
@@ -215,7 +216,7 @@ pub fn spawn_discord_service<C: Connector>(
     let (control_tx, control_rx) = mpsc::channel(16);
     let (status_tx, status_rx) = watch::channel(DiscordStatus::initial(&config));
     let service = Service {
-        connector,
+        connector: std::sync::Arc::new(connector),
         config,
         desired,
         control: control_rx,
@@ -223,6 +224,10 @@ pub fn spawn_discord_service<C: Connector>(
         backoff: Backoff::new(BACKOFF_BASE, BACKOFF_MAX),
         rate: RateLimiter::new(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW),
         last_logged_error: None,
+        last_attempt: None,
+        unresponsive_sessions: 0,
+        session_responsive: false,
+        session_sent: false,
     };
     let task = tokio::spawn(service.run());
     DiscordServiceHandle {
@@ -244,14 +249,42 @@ impl<S> Drop for Session<S> {
     }
 }
 
+/// Why a `SET_ACTIVITY` request was sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// Show the desired activity (or clear it when the desired value is `None`).
+    Desired,
+    /// Re-send the desired activity without artwork after Discord rejected it.
+    WithoutArtwork,
+    /// Clear an older activity because the current one was rejected, so
+    /// Discord does not keep showing an application the user has left.
+    ClearStale,
+}
+
 struct InFlight {
     nonce: String,
-    /// The desired value this request fulfils.
+    /// The desired value this request fulfils (`None` for clears).
     desired: Option<Activity>,
-    /// What was actually sent (may have assets stripped).
-    sent: Option<Activity>,
-    stripped: bool,
+    purpose: Purpose,
+    /// Whether the request carried artwork.
+    had_assets: bool,
     deadline: Instant,
+}
+
+/// Per-connection bookkeeping of what Discord shows and what it refused.
+#[derive(Default)]
+struct SessionState {
+    /// What Discord currently shows from us, per its acknowledgements.
+    applied: Option<Activity>,
+    /// Delivery status that matches `applied`.
+    applied_delivery: Option<ActivityDelivery>,
+    /// A desired value Discord rejected; not re-sent until the desired value changes.
+    rejected: Option<Option<Activity>>,
+    /// A desired value whose artwork was rejected and should be re-sent without it.
+    retry_without_artwork: Option<Option<Activity>>,
+    /// The rejected value for which a stale-activity clear was already attempted.
+    stale_clear_attempted: Option<Option<Activity>>,
+    in_flight: Option<InFlight>,
 }
 
 enum SessionEnd {
@@ -262,11 +295,16 @@ enum SessionEnd {
 
 enum ControlOutcome {
     Restart,
+    Ignore,
     Stop(Option<oneshot::Sender<()>>),
 }
 
+/// Reconnect requests closer together than this are ignored, so a stuck UI
+/// (or anything else) cannot churn connections to Discord.
+pub const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
+
 struct Service<C: Connector> {
-    connector: C,
+    connector: std::sync::Arc<C>,
     config: DiscordServiceConfig,
     desired: watch::Receiver<Option<Activity>>,
     control: mpsc::Receiver<Control>,
@@ -274,17 +312,40 @@ struct Service<C: Connector> {
     backoff: Backoff,
     rate: RateLimiter,
     last_logged_error: Option<String>,
+    last_attempt: Option<Instant>,
+    /// Consecutive sessions in which Discord never answered a command.
+    unresponsive_sessions: u32,
+    /// Set during a session once Discord answers any command.
+    session_responsive: bool,
+    /// Set during a session once any command was sent.
+    session_sent: bool,
 }
 
 fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)
 }
 
+/// Maps a CLOSE frame (RPC close codes) to an error.
 fn close_error(reason: CloseReason) -> RpcError {
     let message = reason.message.unwrap_or_else(|| "no reason given".to_owned());
     match reason.code {
         Some(CLOSE_INVALID_CLIENT_ID) => RpcError::InvalidClientId { message },
         code => RpcError::Closed { code, message },
+    }
+}
+
+/// Maps an ERROR event received during the handshake. ERROR events use the
+/// RPC *error* code table, where 4007 means "Invalid client ID" (and 4000
+/// means "Invalid payload", unlike the close-code table).
+fn handshake_error(code: Option<i64>, message: String) -> RpcError {
+    match code {
+        Some(ERROR_INVALID_CLIENT_ID) => RpcError::InvalidClientId { message },
+        Some(code) => RpcError::Protocol(format!(
+            "Discord reported error {code} during the handshake: {message}"
+        )),
+        None => RpcError::Protocol(format!(
+            "Discord reported an error during the handshake: {message}"
+        )),
     }
 }
 
@@ -315,11 +376,8 @@ async fn open_session<C: Connector>(
                     break message.ready_user_name();
                 }
                 if message.is_error() {
-                    let (code, message) = message.error_details();
-                    return Err(close_error(CloseReason {
-                        code,
-                        message: Some(message),
-                    }));
+                    let (code, text) = message.error_details();
+                    return Err(handshake_error(code, text));
                 }
             }
             Opcode::Close => return Err(close_error(parse_close(&frame.payload))),
@@ -383,17 +441,30 @@ impl<C: Connector> Service<C> {
         changed
     }
 
+    /// Whether a reconnect request should be honoured now.
+    fn reconnect_allowed(&self) -> bool {
+        self.last_attempt
+            .is_none_or(|at| at.elapsed() >= MIN_RECONNECT_INTERVAL)
+    }
+
     fn handle_idle_control(&mut self, control: Option<Control>) -> ControlOutcome {
         match control {
             None => ControlOutcome::Stop(None),
             Some(Control::Shutdown(ack)) => ControlOutcome::Stop(Some(ack)),
             Some(Control::Configure(config)) => {
-                self.apply_config(config);
+                if self.apply_config(config) {
+                    ControlOutcome::Restart
+                } else {
+                    ControlOutcome::Ignore
+                }
+            }
+            Some(Control::Reconnect) if self.reconnect_allowed() => {
+                self.backoff.reset();
                 ControlOutcome::Restart
             }
             Some(Control::Reconnect) => {
-                self.backoff.reset();
-                ControlOutcome::Restart
+                tracing::debug!("ignored reconnect request: the last attempt was moments ago");
+                ControlOutcome::Ignore
             }
         }
     }
@@ -404,44 +475,69 @@ impl<C: Connector> Service<C> {
             let Some(app_id) = self.config.application_id.clone() else {
                 self.update(|s| {
                     s.phase = ConnectionPhase::NotConfigured;
+                    s.endpoint = None;
+                    s.user_name = None;
+                    s.connected_since_ms = None;
                     s.next_retry_at_ms = None;
                     s.last_error = None;
                     s.last_error_kind = None;
                     s.failed_attempts = 0;
+                    s.discord_installed = None;
                     s.delivery = ActivityDelivery::Idle;
+                    s.last_delivery_error = None;
                 });
-                let control = self.control.recv().await;
-                match self.handle_idle_control(control) {
-                    ControlOutcome::Stop(ack) => return self.finish(ack),
-                    ControlOutcome::Restart => continue,
+                loop {
+                    let control = self.control.recv().await;
+                    match self.handle_idle_control(control) {
+                        ControlOutcome::Stop(ack) => return self.finish(ack),
+                        ControlOutcome::Restart => break,
+                        ControlOutcome::Ignore => {}
+                    }
                 }
+                continue;
             };
 
+            self.last_attempt = Some(Instant::now());
             self.update(|s| {
                 s.phase = ConnectionPhase::Connecting;
+                s.endpoint = None;
+                s.user_name = None;
+                s.connected_since_ms = None;
                 s.last_attempt_at_ms = Some(now_unix_ms());
                 s.next_retry_at_ms = None;
             });
 
-            let attempt = tokio::select! {
-                biased;
-                control = self.control.recv() => {
-                    match self.handle_idle_control(control) {
-                        ControlOutcome::Stop(ack) => return self.finish(ack),
-                        ControlOutcome::Restart => continue,
+            let connector = std::sync::Arc::clone(&self.connector);
+            let connect = timeout(CONNECT_TIMEOUT, async move {
+                open_session(&*connector, &app_id).await
+            });
+            tokio::pin!(connect);
+            let attempt = loop {
+                tokio::select! {
+                    biased;
+                    control = self.control.recv() => {
+                        match self.handle_idle_control(control) {
+                            ControlOutcome::Stop(ack) => return self.finish(ack),
+                            ControlOutcome::Restart => break None,
+                            ControlOutcome::Ignore => {}
+                        }
                     }
+                    result = &mut connect => break Some(result.unwrap_or(Err(RpcError::Timeout))),
                 }
-                result = timeout(CONNECT_TIMEOUT, open_session(&self.connector, &app_id)) => {
-                    result.unwrap_or(Err(RpcError::Timeout))
-                }
+            };
+            let Some(attempt) = attempt else {
+                continue;
             };
 
             let error = match attempt {
                 Ok((mut session, endpoint, user_name)) => {
                     let reconnect = connected_before;
                     connected_before = true;
-                    tracing::info!(endpoint = %endpoint, "connected to Discord");
-                    self.last_logged_error = None;
+                    if self.unresponsive_sessions == 0 {
+                        tracing::info!(endpoint = %endpoint, "connected to Discord");
+                    } else {
+                        tracing::debug!(endpoint = %endpoint, "connected to Discord again");
+                    }
                     self.update(|s| {
                         s.phase = ConnectionPhase::Connected;
                         s.endpoint = Some(endpoint);
@@ -457,9 +553,24 @@ impl<C: Connector> Service<C> {
                             s.reconnects += 1;
                         }
                     });
+                    self.session_responsive = false;
+                    self.session_sent = false;
                     let started = Instant::now();
                     let end = self.run_session(&mut session).await;
                     drop(session);
+                    // A session is healthy if Discord answered a command, or if
+                    // there was nothing to send and the connection simply lasted.
+                    // A connection that accepts the handshake but never answers
+                    // must not reset the backoff, or it would reconnect forever
+                    // at the minimum delay.
+                    let healthy = self.session_responsive
+                        || (!self.session_sent && started.elapsed() >= STABLE_CONNECTION);
+                    if healthy {
+                        self.unresponsive_sessions = 0;
+                        self.last_logged_error = None;
+                    } else {
+                        self.unresponsive_sessions = self.unresponsive_sessions.saturating_add(1);
+                    }
                     match end {
                         SessionEnd::Shutdown(ack) => return self.finish(ack),
                         SessionEnd::Restart => {
@@ -467,7 +578,7 @@ impl<C: Connector> Service<C> {
                             continue;
                         }
                         SessionEnd::Failed(error) => {
-                            if started.elapsed() >= STABLE_CONNECTION {
+                            if healthy {
                                 self.backoff.reset();
                             }
                             error
@@ -505,14 +616,19 @@ impl<C: Connector> Service<C> {
                 s.delivery = ActivityDelivery::Idle;
             });
 
-            tokio::select! {
-                biased;
-                control = self.control.recv() => {
-                    if let ControlOutcome::Stop(ack) = self.handle_idle_control(control) {
-                        return self.finish(ack);
+            let retry_at = Instant::now() + delay;
+            loop {
+                tokio::select! {
+                    biased;
+                    control = self.control.recv() => {
+                        match self.handle_idle_control(control) {
+                            ControlOutcome::Stop(ack) => return self.finish(ack),
+                            ControlOutcome::Restart => break,
+                            ControlOutcome::Ignore => {}
+                        }
                     }
+                    _ = sleep_until(retry_at) => break,
                 }
-                _ = sleep(delay) => {}
             }
         }
     }
@@ -552,51 +668,167 @@ impl<C: Connector> Service<C> {
         session: &mut Session<C::Stream>,
         sent: Option<Activity>,
         desired: Option<Activity>,
-        stripped: bool,
+        purpose: Purpose,
     ) -> Result<InFlight, RpcError> {
         let nonce = new_nonce();
         let payload = set_activity_payload(self.config.pid, sent.as_ref(), &nonce)?;
         self.rate.record(Instant::now());
+        self.session_sent = true;
         write_timed(&mut session.writer, Opcode::Frame, &payload).await?;
-        self.update(|s| s.delivery = ActivityDelivery::Pending);
+        if purpose != Purpose::ClearStale {
+            self.update(|s| s.delivery = ActivityDelivery::Pending);
+        }
         Ok(InFlight {
             nonce,
+            had_assets: sent.as_ref().is_some_and(Activity::has_assets),
             desired,
-            sent,
-            stripped,
+            purpose,
             deadline: Instant::now() + RESPONSE_TIMEOUT,
         })
     }
 
+    /// Decides what, if anything, to send next for the current desired value.
+    /// Returns `(sent, desired, purpose)`.
+    fn next_request(
+        &self,
+        state: &mut SessionState,
+        desired: &Option<Activity>,
+    ) -> Option<(Option<Activity>, Option<Activity>, Purpose)> {
+        // A pending artwork-less retry only applies while that value is still wanted.
+        if state
+            .retry_without_artwork
+            .as_ref()
+            .is_some_and(|value| value != desired)
+        {
+            state.retry_without_artwork = None;
+        }
+        if let Some(original) = &state.retry_without_artwork {
+            let stripped = original.as_ref().map(Activity::without_assets);
+            return Some((stripped, original.clone(), Purpose::WithoutArtwork));
+        }
+        if state.rejected.as_ref() == Some(desired) {
+            // Discord refused the current value. Don't leave an older activity
+            // (from an application the user has left) on the profile.
+            if state.applied.is_some() && state.stale_clear_attempted.as_ref() != Some(desired) {
+                return Some((None, None, Purpose::ClearStale));
+            }
+            return None;
+        }
+        if *desired != state.applied {
+            return Some((desired.clone(), desired.clone(), Purpose::Desired));
+        }
+        // Discord already shows the desired value. If an earlier, different
+        // value was rejected, the status must describe what is shown now.
+        if state.rejected.take().is_some() {
+            let delivery = state.applied_delivery.unwrap_or(ActivityDelivery::Idle);
+            self.update(|s| {
+                s.delivery = delivery;
+                if delivery != ActivityDelivery::AcceptedWithoutAssets {
+                    s.last_delivery_error = None;
+                }
+            });
+        }
+        None
+    }
+
+    fn handle_response(
+        &mut self,
+        state: &mut SessionState,
+        request: InFlight,
+        message: &super::protocol::Incoming,
+    ) {
+        self.session_responsive = true;
+        if message.is_error() {
+            let (code, text) = message.error_details();
+            match request.purpose {
+                Purpose::Desired if request.had_assets => {
+                    tracing::warn!(code, error = %text, "Discord rejected the activity; retrying without artwork");
+                    state.retry_without_artwork = Some(request.desired);
+                    self.update(|s| {
+                        s.last_delivery_error = Some(format!(
+                            "Discord rejected the artwork ({text}). Showing the activity without images."
+                        ))
+                    });
+                }
+                Purpose::Desired | Purpose::WithoutArtwork => {
+                    tracing::warn!(code, error = %text, "Discord rejected the activity");
+                    state.retry_without_artwork = None;
+                    state.rejected = Some(request.desired);
+                    self.update(|s| {
+                        s.delivery = ActivityDelivery::Rejected;
+                        s.last_delivery_error = Some(match code {
+                            Some(code) => format!("Discord rejected the activity (code {code}): {text}"),
+                            None => format!("Discord rejected the activity: {text}"),
+                        });
+                    });
+                }
+                Purpose::ClearStale => {
+                    tracing::warn!(code, error = %text, "Discord rejected clearing the previous activity");
+                    state.stale_clear_attempted = state.rejected.clone();
+                }
+            }
+            return;
+        }
+
+        match request.purpose {
+            Purpose::ClearStale => {
+                // Keep reporting the rejection; Discord now shows nothing from us.
+                state.stale_clear_attempted = state.rejected.clone();
+                state.applied = None;
+                state.applied_delivery = Some(ActivityDelivery::Cleared);
+                self.update(|s| s.last_activity_update_at_ms = Some(now_unix_ms()));
+            }
+            Purpose::Desired | Purpose::WithoutArtwork => {
+                let delivery = if request.desired.is_none() {
+                    ActivityDelivery::Cleared
+                } else if request.purpose == Purpose::WithoutArtwork {
+                    ActivityDelivery::AcceptedWithoutAssets
+                } else {
+                    ActivityDelivery::Accepted
+                };
+                state.applied = request.desired;
+                state.applied_delivery = Some(delivery);
+                state.rejected = None;
+                state.retry_without_artwork = None;
+                state.stale_clear_attempted = None;
+                self.update(|s| {
+                    s.delivery = delivery;
+                    s.last_activity_update_at_ms = Some(now_unix_ms());
+                    if delivery != ActivityDelivery::AcceptedWithoutAssets {
+                        s.last_delivery_error = None;
+                    }
+                });
+            }
+        }
+    }
+
     async fn run_session(&mut self, session: &mut Session<C::Stream>) -> SessionEnd {
         // A fresh connection has no activity from us.
-        let mut applied: Option<Activity> = None;
-        let mut rejected: Option<Option<Activity>> = None;
-        let mut in_flight: Option<InFlight> = None;
+        let mut state = SessionState::default();
         let mut desired_open = true;
 
         loop {
             let mut wake_at: Option<Instant> = None;
-            if in_flight.is_none() {
+            if state.in_flight.is_none() {
                 let desired = self.desired.borrow_and_update().clone();
-                if desired != applied && rejected.as_ref() != Some(&desired) {
+                if let Some((sent, value, purpose)) = self.next_request(&mut state, &desired) {
                     match self.rate.ready_at(Instant::now()) {
-                        None => match self.send_activity(session, desired.clone(), desired, false).await {
-                            Ok(request) => in_flight = Some(request),
+                        None => match self.send_activity(session, sent, value, purpose).await {
+                            Ok(request) => state.in_flight = Some(request),
                             Err(error) => return SessionEnd::Failed(error),
                         },
                         Some(at) => wake_at = Some(at),
                     }
                 }
             }
-            let deadline = in_flight.as_ref().map(|f| f.deadline);
+            let deadline = state.in_flight.as_ref().map(|f| f.deadline);
 
             tokio::select! {
                 biased;
                 control = self.control.recv() => match control {
                     None => return SessionEnd::Shutdown(None),
                     Some(Control::Shutdown(ack)) => {
-                        self.clear_before_close(session, applied.is_some()).await;
+                        self.clear_before_close(session, state.applied.is_some()).await;
                         return SessionEnd::Shutdown(Some(ack));
                     }
                     Some(Control::Configure(config)) => {
@@ -606,7 +838,12 @@ impl<C: Connector> Service<C> {
                             return SessionEnd::Restart;
                         }
                     }
-                    Some(Control::Reconnect) => return SessionEnd::Restart,
+                    Some(Control::Reconnect) => {
+                        if self.reconnect_allowed() {
+                            return SessionEnd::Restart;
+                        }
+                        tracing::debug!("ignored reconnect request: connected moments ago");
+                    }
                 },
                 frame = session.frames.recv() => {
                     let frame = match frame {
@@ -630,51 +867,15 @@ impl<C: Connector> Service<C> {
                                 Ok(message) => message,
                                 Err(error) => return SessionEnd::Failed(error),
                             };
-                            let Some(request) = in_flight.take_if(|f| message.nonce.as_deref() == Some(f.nonce.as_str())) else {
+                            let matches = state
+                                .in_flight
+                                .as_ref()
+                                .is_some_and(|f| message.nonce.as_deref() == Some(f.nonce.as_str()));
+                            if !matches {
                                 continue; // Unrelated dispatch event.
-                            };
-                            if message.is_error() {
-                                let (code, text) = message.error_details();
-                                let retry_without_assets = !request.stripped
-                                    && request.sent.as_ref().is_some_and(Activity::has_assets);
-                                if retry_without_assets {
-                                    tracing::warn!(code, error = %text, "Discord rejected the activity; retrying without artwork");
-                                    self.update(|s| s.last_delivery_error = Some(format!(
-                                        "Discord rejected the artwork ({text}). Showing the activity without images."
-                                    )));
-                                    let stripped = request.sent.as_ref().map(Activity::without_assets);
-                                    match self.send_activity(session, stripped, request.desired, true).await {
-                                        Ok(retry) => in_flight = Some(retry),
-                                        Err(error) => return SessionEnd::Failed(error),
-                                    }
-                                } else {
-                                    tracing::warn!(code, error = %text, "Discord rejected the activity");
-                                    rejected = Some(request.desired);
-                                    self.update(|s| {
-                                        s.delivery = ActivityDelivery::Rejected;
-                                        s.last_delivery_error = Some(match code {
-                                            Some(code) => format!("Discord rejected the activity (code {code}): {text}"),
-                                            None => format!("Discord rejected the activity: {text}"),
-                                        });
-                                    });
-                                }
-                            } else {
-                                let delivery = if request.desired.is_none() {
-                                    ActivityDelivery::Cleared
-                                } else if request.stripped {
-                                    ActivityDelivery::AcceptedWithoutAssets
-                                } else {
-                                    ActivityDelivery::Accepted
-                                };
-                                applied = request.desired;
-                                rejected = None;
-                                self.update(|s| {
-                                    s.delivery = delivery;
-                                    s.last_activity_update_at_ms = Some(now_unix_ms());
-                                    if delivery != ActivityDelivery::AcceptedWithoutAssets {
-                                        s.last_delivery_error = None;
-                                    }
-                                });
+                            }
+                            if let Some(request) = state.in_flight.take() {
+                                self.handle_response(&mut state, request, &message);
                             }
                         }
                     }
@@ -706,14 +907,21 @@ impl<C: Connector> Service<C> {
             write_frame(&mut session.writer, Opcode::Frame, &payload).await?;
             while let Some(frame) = session.frames.recv().await {
                 let frame = frame?;
-                if frame.opcode == Opcode::Frame
-                    && parse_incoming(&frame.payload)
-                        .is_ok_and(|m| m.nonce.as_deref() == Some(nonce.as_str()))
-                {
+                if frame.opcode != Opcode::Frame {
+                    continue;
+                }
+                let Ok(message) = parse_incoming(&frame.payload) else {
+                    continue;
+                };
+                if message.nonce.as_deref() == Some(nonce.as_str()) {
+                    if message.is_error() {
+                        let (code, text) = message.error_details();
+                        return Err(RpcError::Closed { code, message: text });
+                    }
                     return Ok::<(), RpcError>(());
                 }
             }
-            Ok(())
+            Err(RpcError::Eof)
         })
         .await;
         match attempt {
@@ -721,8 +929,8 @@ impl<C: Connector> Service<C> {
                 self.update(|s| s.delivery = ActivityDelivery::Cleared);
                 tracing::info!("cleared Discord activity before shutdown");
             }
-            Ok(Err(error)) => tracing::debug!(%error, "could not clear activity before shutdown"),
-            Err(_) => tracing::debug!("timed out clearing activity before shutdown"),
+            Ok(Err(error)) => tracing::warn!(%error, "could not clear the activity before shutdown"),
+            Err(_) => tracing::warn!("timed out clearing the activity before shutdown"),
         }
     }
 }

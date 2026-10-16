@@ -10,6 +10,7 @@
 //! most processes without administrator rights. Nothing is injected and no
 //! process memory is read.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::{
@@ -51,17 +52,27 @@ const SHELL_CLASSES: &[&str] = &[
 const FRAME_HOST_CLASS: &str = "ApplicationFrameWindow";
 const CORE_WINDOW_CLASS: &str = "Windows.UI.Core.CoreWindow";
 
-pub struct Win32WindowSystem;
+pub struct Win32WindowSystem {
+    /// Last hosted process seen for each UWP frame window (keyed by handle).
+    /// A minimized or suspended Store app detaches its CoreWindow from the
+    /// frame; the cached PID keeps it listed, like a minimized Win32 app,
+    /// until the frame closes.
+    frame_pids: HashMap<isize, u32>,
+}
 
 impl Win32WindowSystem {
     pub fn new() -> Self {
-        Self
+        Self {
+            frame_pids: HashMap::new(),
+        }
     }
 }
 
-struct EnumContext {
+struct EnumContext<'a> {
     windows: Vec<RawWindow>,
     with_titles: bool,
+    frame_pids: &'a mut HashMap<isize, u32>,
+    seen_frames: Vec<isize>,
 }
 
 fn class_name(hwnd: HWND) -> String {
@@ -71,6 +82,27 @@ fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..usize::try_from(len).unwrap_or(0).min(buf.len())])
 }
 
+/// Whether the window has a non-empty title, without reading the text (used
+/// when window-title capture is off, so titles never enter our memory).
+fn has_title(hwnd: HWND) -> bool {
+    // SAFETY: plain query on a window handle.
+    unsafe { GetWindowTextLengthW(hwnd) > 0 }
+}
+
+/// Whether `hwnd` is a visible window collapsed to (almost) zero size, as used
+/// by some frameworks (e.g. classic Delphi VCL) for their taskbar window.
+fn is_zero_size_visible(hwnd: HWND) -> bool {
+    // SAFETY: plain queries on a window handle.
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect).is_ok() && (rect.right - rect.left <= 1 || rect.bottom - rect.top <= 1)
+    }
+}
+
+/// Reads a window title. Only called when window-title capture is enabled.
 fn window_title(hwnd: HWND) -> Option<String> {
     // SAFETY: plain query on a window handle.
     let len = unsafe { GetWindowTextLengthW(hwnd) };
@@ -140,9 +172,25 @@ fn uwp_child_pid(frame: HWND, frame_pid: u32) -> Option<u32> {
     search.found
 }
 
+/// Resolves the process behind an `ApplicationFrameWindow`, remembering it so
+/// the app stays identified while it is minimized or suspended.
+fn resolve_frame_pid(frame: HWND, frame_pid: u32, cache: &mut HashMap<isize, u32>) -> u32 {
+    let key = frame.0 as isize;
+    match uwp_child_pid(frame, frame_pid) {
+        Some(pid) => {
+            cache.insert(key, pid);
+            pid
+        }
+        // Without a cached PID (e.g. the app was already suspended when
+        // DeskPresence started) this resolves to the frame host, which the
+        // detector ignores.
+        None => cache.get(&key).copied().unwrap_or(frame_pid),
+    }
+}
+
 /// Applies the application-window filter. Returns `None` for windows that are
 /// not user-facing application windows.
-fn inspect(hwnd: HWND, with_titles: bool) -> Option<RawWindow> {
+fn inspect(hwnd: HWND, with_titles: bool, frame_pids: &mut HashMap<isize, u32>) -> Option<RawWindow> {
     // SAFETY: simple queries on a handle supplied by EnumWindows.
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
@@ -154,7 +202,13 @@ fn inspect(hwnd: HWND, with_titles: bool) -> Option<RawWindow> {
             if ex_style & WS_EX_TOOLWINDOW.0 != 0 || ex_style & WS_EX_NOACTIVATE.0 != 0 {
                 return None;
             }
-            if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.is_invalid()) {
+            // Owned windows are dialogs/popups of another window, except when
+            // the owner is a visible zero-size taskbar window (legacy
+            // frameworks); then the owned window is the real main window.
+            if let Ok(owner) = GetWindow(hwnd, GW_OWNER)
+                && !owner.is_invalid()
+                && !is_zero_size_visible(owner)
+            {
                 return None;
             }
         }
@@ -173,21 +227,15 @@ fn inspect(hwnd: HWND, with_titles: bool) -> Option<RawWindow> {
     if SHELL_CLASSES.contains(&class.as_str()) {
         return None;
     }
-    let title = window_title(hwnd);
-    let has_title = title.is_some();
     // SAFETY: plain query.
     let app_window = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 } & WS_EX_APPWINDOW.0 != 0;
-    if !has_title && !app_window {
+    if !has_title(hwnd) && !app_window {
         return None;
     }
 
     let mut pid = window_pid(hwnd);
     if class == FRAME_HOST_CLASS {
-        // Suspended/minimized UWP apps have no CoreWindow child; they then
-        // resolve to the frame host, which the detector ignores.
-        if let Some(child) = uwp_child_pid(hwnd, pid) {
-            pid = child;
-        }
+        pid = resolve_frame_pid(hwnd, pid, frame_pids);
     }
     if pid == 0 {
         return None;
@@ -195,14 +243,18 @@ fn inspect(hwnd: HWND, with_titles: bool) -> Option<RawWindow> {
     Some(RawWindow {
         handle: hwnd.0 as usize as u64,
         pid,
-        title: if with_titles { title } else { None },
+        // Titles are read only with the privacy opt-in.
+        title: if with_titles { window_title(hwnd) } else { None },
     })
 }
 
 unsafe extern "system" fn enum_top_level(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // SAFETY: lparam points at the `EnumContext` owned by `top_level_windows`.
-    let context = unsafe { &mut *(lparam.0 as *mut EnumContext) };
-    if let Some(window) = inspect(hwnd, context.with_titles) {
+    let context = unsafe { &mut *(lparam.0 as *mut EnumContext<'_>) };
+    if class_name(hwnd) == FRAME_HOST_CLASS {
+        context.seen_frames.push(hwnd.0 as isize);
+    }
+    if let Some(window) = inspect(hwnd, context.with_titles, context.frame_pids) {
         context.windows.push(window);
     }
     BOOL(1)
@@ -268,16 +320,23 @@ impl WindowSystem for Win32WindowSystem {
         let mut context = EnumContext {
             windows: Vec::with_capacity(64),
             with_titles,
+            frame_pids: &mut self.frame_pids,
+            seen_frames: Vec::new(),
         };
         // SAFETY: the callback only dereferences `context`, which outlives the call.
         unsafe {
             EnumWindows(
                 Some(enum_top_level),
-                LPARAM(&mut context as *mut EnumContext as isize),
+                LPARAM(&mut context as *mut EnumContext<'_> as isize),
             )
         }
         .map_err(|e| DetectError::Os(e.to_string()))?;
-        Ok(context.windows)
+        let EnumContext {
+            windows, seen_frames, ..
+        } = context;
+        // Forget frames that no longer exist.
+        self.frame_pids.retain(|frame, _| seen_frames.contains(frame));
+        Ok(windows)
     }
 
     fn foreground_window(&mut self, with_title: bool) -> Option<RawWindow> {
@@ -294,10 +353,8 @@ impl WindowSystem for Win32WindowSystem {
             return None;
         }
         let mut pid = window_pid(root);
-        if class == FRAME_HOST_CLASS
-            && let Some(child) = uwp_child_pid(root, pid)
-        {
-            pid = child;
+        if class == FRAME_HOST_CLASS {
+            pid = resolve_frame_pid(root, pid, &mut self.frame_pids);
         }
         (pid != 0).then(|| RawWindow {
             handle: root.0 as usize as u64,
