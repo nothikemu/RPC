@@ -33,6 +33,10 @@ pub enum ConfigError {
     TooLarge { size: u64, limit: u64 },
     #[error("the configuration is invalid: {}", summarize(.0))]
     Invalid(Vec<ValidationIssue>),
+    #[error(
+        "the previous settings file could not be backed up, so it was not overwritten ({0}). Close programs that may be using it and try again"
+    )]
+    BackupFailed(String),
 }
 
 fn summarize(issues: &[ValidationIssue]) -> String {
@@ -59,6 +63,8 @@ pub fn parse_config(text: &str) -> Result<(Config, MigrationReport), ConfigError
             limit: MAX_CONFIG_BYTES,
         });
     }
+    // Notepad and PowerShell 5.1 can save UTF-8 with a byte order mark.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| ConfigError::Json(e.to_string()))?;
     let (value, report) = migrate_value(value)?;

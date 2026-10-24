@@ -338,7 +338,13 @@ pub fn build_diagnostics_bundle(input: &BundleInput<'_>) -> serde_json::Value {
             "state": hide(&a.state),
             "name": hide(&a.name),
             "has_timestamps": a.timestamps.is_some(),
-            "assets": a.assets,
+            // Hover texts are rendered templates and may contain window titles.
+            "assets": a.assets.as_ref().map(|assets| serde_json::json!({
+                "large_image": assets.large_image,
+                "large_text": hide(&assets.large_text),
+                "small_image": assets.small_image,
+                "small_text": hide(&assets.small_text),
+            })),
         })
     });
 

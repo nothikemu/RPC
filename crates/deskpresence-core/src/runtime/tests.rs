@@ -254,3 +254,69 @@ async fn build_default_application_id_is_used_when_valid() {
     assert_eq!(preview.details.as_deref(), Some(SAMPLE_APP));
     runtime.shutdown(Duration::from_secs(3)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_export_hides_window_titles_and_user_names_by_default() {
+    use crate::api::{BundleInput, build_diagnostics_bundle};
+    use crate::diagnostics::Redactor;
+    use crate::rules::AssetOverrides;
+
+    const SECRET: &str = "Quarterly plan draft";
+    let path = r"C:\Users\Alice\Apps\alpha.exe";
+    let ws = MockWindowSystem::new();
+    ws.add(MockApp::new(10, path).description("Alpha Studio").title(SECRET));
+    ws.focus_pid(10);
+    let mut config = fast_config(None);
+    config.privacy.capture_window_titles = true;
+    config.presence.details_template = "{window_title}".into();
+    config.presence.default_assets = AssetOverrides {
+        large_image: Some("logo".into()),
+        large_text: Some("Editing {window_title}".into()),
+        ..AssetOverrides::default()
+    };
+    let runtime = Runtime::start(
+        RuntimeOptions {
+            config: Arc::new(config.clone()),
+            default_application_id: None,
+            pid: 1,
+        },
+        Box::new(ws.clone()),
+        MockDiscord::new(Behavior::Normal),
+    )
+    .unwrap();
+    let handle = runtime.handle();
+    let view = eventually("activity with the window title", || {
+        let v = handle.view();
+        let has_title = v
+            .presence
+            .activity
+            .as_ref()
+            .and_then(|a| a.assets.as_ref())
+            .and_then(|a| a.large_text.as_deref())
+            .is_some_and(|t| t.contains(SECRET));
+        has_title.then_some(v)
+    })
+    .await;
+
+    let redactor = Redactor::with_home(Some(r"C:\Users\Alice"));
+    let export = |include_sensitive| {
+        build_diagnostics_bundle(&BundleInput {
+            app_version: "test",
+            os: "test",
+            generated_at_ms: 0,
+            config: &config,
+            view: &view,
+            log_tail: r"opened C:\Users\Alice\Apps\alpha.exe",
+            include_sensitive,
+            redactor: &redactor,
+        })
+        .to_string()
+    };
+    let redacted = export(false);
+    assert!(!redacted.contains(SECRET), "{redacted}");
+    assert!(!redacted.contains("Alice"), "{redacted}");
+    assert!(redacted.contains("\"large_image\":\"logo\""), "{redacted}");
+    let full = export(true);
+    assert!(full.contains(SECRET) && full.contains("Alice"));
+    runtime.shutdown(Duration::from_secs(3)).await;
+}

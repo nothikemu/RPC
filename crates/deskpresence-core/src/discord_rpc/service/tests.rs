@@ -479,11 +479,13 @@ async fn an_unresponsive_discord_does_not_reset_the_backoff() {
     })
     .await;
     settle(Duration::from_secs(600)).await;
-    // With a reset every cycle this would be ~56 connections; with growing
-    // backoff (up to 60 s) plus the 10 s response timeout it is far fewer.
+    // Each cycle is the 10 s response timeout plus a jittered delay of
+    // [ceiling/2, ceiling] with ceilings 1, 2, 4, ... 60 s. Even with the
+    // shortest delays that is at most ~19 connections in 10 minutes (observed:
+    // 15-17); a backoff reset every cycle would give ~56.
     let connects = mock.connects();
     assert!(
-        (4..=15).contains(&connects),
+        (4..=20).contains(&connects),
         "reconnected {connects} times in 10 minutes"
     );
     handle.shutdown(Duration::from_secs(1)).await;

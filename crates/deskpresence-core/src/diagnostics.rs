@@ -179,24 +179,41 @@ impl Redactor {
     }
 }
 
-fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+fn chars_eq_ignore_case(a: char, b: char) -> bool {
+    a == b || a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// Finds `needle` in `haystack[from..]`, comparing character by character
+/// without regard to case. Returns byte offsets into `haystack`, always on
+/// character boundaries (lower-casing whole strings would shift offsets for
+/// characters whose lower-case form has a different length, such as `İ`).
+fn find_ignore_case(haystack: &str, needle: &[char], from: usize) -> Option<(usize, usize)> {
     if needle.is_empty() {
-        return haystack.to_owned();
+        return None;
     }
-    let lower_hay = haystack.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    // Lower-casing can change byte lengths for some scripts; fall back to an
-    // exact match in that case rather than risk slicing mid-character.
-    if lower_hay.len() != haystack.len() || lower_needle.len() != needle.len() {
-        return haystack.replace(needle, replacement);
-    }
+    let rest = haystack.get(from..)?;
+    rest.char_indices().find_map(|(offset, _)| {
+        let start = from + offset;
+        let mut candidate = haystack[start..].char_indices();
+        let mut end = start;
+        for &expected in needle {
+            match candidate.next() {
+                Some((i, c)) if chars_eq_ignore_case(c, expected) => end = start + i + c.len_utf8(),
+                _ => return None,
+            }
+        }
+        Some((start, end))
+    })
+}
+
+fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let needle: Vec<char> = needle.chars().collect();
     let mut out = String::with_capacity(haystack.len());
     let mut i = 0;
-    while let Some(pos) = lower_hay[i..].find(&lower_needle) {
-        let start = i + pos;
+    while let Some((start, end)) = find_ignore_case(haystack, &needle, i) {
         out.push_str(&haystack[i..start]);
         out.push_str(replacement);
-        i = start + needle.len();
+        i = end;
     }
     out.push_str(&haystack[i..]);
     out
@@ -204,14 +221,10 @@ fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> 
 
 /// Replaces the path segment following `marker` (case-insensitive) with `<user>`.
 fn redact_segment_after(text: &str, marker: &str) -> String {
-    let lower = text.to_lowercase();
-    if lower.len() != text.len() {
-        return text.to_owned();
-    }
+    let marker: Vec<char> = marker.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    while let Some(pos) = lower[i..].find(marker) {
-        let seg_start = i + pos + marker.len();
+    while let Some((_, seg_start)) = find_ignore_case(text, &marker, i) {
         out.push_str(&text[i..seg_start]);
         let rest = &text[seg_start..];
         let seg_len = rest
@@ -300,5 +313,24 @@ mod tests {
             r.redact(r"C:\Program Files\App\app.exe"),
             r"C:\Program Files\App\app.exe"
         );
+    }
+
+    #[test]
+    fn characters_whose_case_changes_length_neither_panic_nor_leak() {
+        // `İ` lower-cases to two characters (3 bytes) and `Ω` (OHM SIGN, 3
+        // bytes) to `ω` (2 bytes).
+        let r = Redactor::with_home(Some(r"C:\Users\İsmail"));
+        assert_eq!(
+            r.redact(r"c:\Users\İsmail\Games\x.exe"),
+            r"%USERPROFILE%\Games\x.exe"
+        );
+        assert_eq!(r.redact("İC:\\Users\\Alice\u{2126}"), "İC:\\Users\\<user>");
+        assert_eq!(
+            r.redact("İ C:\\Users\\émile\\app.exe \u{2126}"),
+            "İ C:\\Users\\<user>\\app.exe \u{2126}"
+        );
+        assert_eq!(r.redact("D:\\USERS\\Bob\\x"), "D:\\USERS\\<user>\\x");
+        assert_eq!(r.redact(""), "");
+        assert_eq!(r.redact("\\users\\"), "\\users\\");
     }
 }

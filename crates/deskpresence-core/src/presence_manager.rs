@@ -243,6 +243,21 @@ pub fn effective_templates<'a>(config: &'a Config, rule: Option<&'a AppRule>) ->
     (details, state)
 }
 
+/// Effective hover-text templates (large, small): the rule's override, else
+/// the default.
+fn effective_hover_templates<'a>(config: &'a Config, rule: Option<&'a AppRule>) -> [Option<&'a str>; 2] {
+    let defaults = &config.presence.default_assets;
+    let assets = rule.map(|r| &r.assets);
+    [
+        assets
+            .and_then(|a| a.large_text.as_deref())
+            .or(defaults.large_text.as_deref()),
+        assets
+            .and_then(|a| a.small_text.as_deref())
+            .or(defaults.small_text.as_deref()),
+    ]
+}
+
 fn render_field(
     source: &str,
     field: PresenceField,
@@ -275,17 +290,29 @@ fn fit_text(text: &str, field: PresenceField, warnings: &mut Vec<PresenceWarning
     if text.is_empty() {
         return None;
     }
+    // The text is not quoted in warnings: it may contain a window title, and
+    // warnings appear in diagnostics.
     if discord_len(text) < DISCORD_TEXT_MIN {
         warn(
             warnings,
             field,
             format!(
-                "“{text}” is shorter than {DISCORD_TEXT_MIN} characters, which Discord rejects. The field was left out."
+                "The text is shorter than {DISCORD_TEXT_MIN} characters, which Discord rejects. The field was left out."
             ),
         );
         return None;
     }
     let fitted = fit_discord_text(text, DISCORD_TEXT_LIMIT);
+    // A single grapheme cluster longer than the limit (e.g. a letter with
+    // hundreds of combining marks) leaves only the ellipsis.
+    if discord_len(&fitted.text) < DISCORD_TEXT_MIN {
+        warn(
+            warnings,
+            field,
+            "The text could not be shortened to Discord's limit, so the field was left out.",
+        );
+        return None;
+    }
     if fitted.truncated {
         warn(
             warnings,
@@ -517,8 +544,14 @@ impl PresenceEngine {
         });
 
         let (details_src, state_src) = effective_templates(config, rule);
-        let uses_elapsed = [details_src, state_src]
-            .iter()
+        let [large_text_src, small_text_src] = effective_hover_templates(config, rule);
+        // Hover texts count only when they are sent (they need an image).
+        let assets = built.activity.assets.as_ref();
+        let large_text_src = large_text_src.filter(|_| assets.is_some_and(|a| a.large_text.is_some()));
+        let small_text_src = small_text_src.filter(|_| assets.is_some_and(|a| a.small_text.is_some()));
+        let uses_elapsed = [Some(details_src), Some(state_src), large_text_src, small_text_src]
+            .into_iter()
+            .flatten()
             .any(|src| Template::parse(src).is_ok_and(|t| t.uses(Variable::Elapsed)));
         let next_refresh_ms = uses_elapsed.then(|| {
             let minutes = elapsed_ms / 60_000;
@@ -920,6 +953,60 @@ mod tests {
         assert_eq!(
             evaluate(&mut engine, &snap, &config, 170_000).next_refresh_ms,
             None
+        );
+    }
+
+    #[test]
+    fn elapsed_in_hover_text_also_refreshes() {
+        let mut config = Config::default();
+        config.presence.default_assets = AssetOverrides {
+            large_text: Some("Session: {elapsed}".into()),
+            ..AssetOverrides::default()
+        };
+        let mut engine = PresenceEngine::new();
+        let snap = snapshot(vec![app(A, Some(1))], Some(A));
+        // Without an image the hover text is not sent, so no refresh is needed.
+        assert_eq!(
+            evaluate(&mut engine, &snap, &config, 100_000).next_refresh_ms,
+            None
+        );
+
+        config.presence.default_assets.large_image = Some("logo".into());
+        let out = evaluate(&mut engine, &snap, &config, 100_000);
+        assert_eq!(out.next_refresh_ms, Some(160_000));
+        let out = evaluate(&mut engine, &snap, &config, 160_000);
+        let assets = out.activity.unwrap().assets.unwrap();
+        assert_eq!(assets.large_text.as_deref(), Some("Session: 1m"));
+    }
+
+    #[test]
+    fn text_that_cannot_be_shortened_is_left_out_not_sent_as_an_ellipsis() {
+        let mut config = Config::default();
+        config.presence.details_template = format!("Z{}", "\u{0301}".repeat(150));
+        let mut engine = PresenceEngine::new();
+        let snap = snapshot(vec![app(A, Some(1))], Some(A));
+        let out = evaluate(&mut engine, &snap, &config, 0);
+        assert_eq!(out.activity.unwrap().details, None);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.field == PresenceField::Details && w.message.contains("could not be shortened"))
+        );
+    }
+
+    #[test]
+    fn warnings_do_not_quote_rendered_text() {
+        let mut config = Config::default();
+        config.privacy.capture_window_titles = true;
+        config.presence.state_template = "{window_title}".into();
+        let mut a = app(A, Some(1));
+        a.window_title = Some("X".into());
+        let mut engine = PresenceEngine::new();
+        let out = evaluate(&mut engine, &snapshot(vec![a], Some(A)), &config, 0);
+        assert!(
+            out.warnings.iter().all(|w| !w.message.contains('X')),
+            "{:?}",
+            out.warnings
         );
     }
 
